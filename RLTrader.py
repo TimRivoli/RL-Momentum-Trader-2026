@@ -5,16 +5,17 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import _classes.Constants as CONSTANTS
-from _classes.RLEnvironment import RLTradingEnvironment, N_BLENDS, N_COUNTS, decode_action, REEVAL_INTERVAL
+from _classes.RLEnvironment import RLTradingEnvironment, N_BLENDS, decode_action, REEVAL_INTERVAL
 from _classes.RLNetwork import MomentumActorCritic
 from _classes.RLTrainer import PPOTrainer
 from _classes.Trading import TradingModel, TradeModelParams
 from _classes.Selection import StockPicker
 from _classes.TickerLists import TickerLists
+from _classes.Prices import PricingData
 
-VERSION    = "V1.2"
-STATE_DIM  = 31   # 14 market + 7 universe + 7 portfolio + 3 calendar
-ACTION_DIM = N_BLENDS * N_COUNTS * 2  # ~80
+VERSION    = "V1.3"
+STATE_DIM  = 33   # 14 market + 7 universe + 7 portfolio + 3 calendar + 2 last-action
+ACTION_DIM = N_BLENDS * 2             # 16: 8 blends × 2 (hold/rebalance)
 
 ALL_PERIODS = [
 	('1/1/1980', 3), ('1/1/1983', 3), ('1/1/1986', 3), ('1/1/1989', 3), ('1/1/1992', 3),
@@ -43,14 +44,16 @@ def make_params(start: str, years: int, model_name: str = None) -> TradeModelPar
 	return p
 
 
-def train_one_period(model_path: str, period: tuple, picker: StockPicker, n_passes: int = 10):
+def train_one_period(model_path: str, period: tuple, picker: StockPicker, n_passes: int = 50, fold_label: str = None):
 	"""
 	Train (or continue training) a fold's model on a single period.
 	Loads from model_path if it exists, otherwise initialises a fresh model.
 	Saves the updated checkpoint back to model_path when done.
+	fold_label identifies which CV fold owns this model (e.g. "test1983").
 	"""
 	start, years = period
 	start_year = pd.Timestamp(start).year
+	label = fold_label or f"train{start_year}"
 
 	model = MomentumActorCritic(state_dim=STATE_DIM, action_dim=ACTION_DIM)
 	checkpoint = None
@@ -65,11 +68,18 @@ def train_one_period(model_path: str, period: tuple, picker: StockPicker, n_pass
 	total_ep = checkpoint.get("episode", 0) if checkpoint else 0
 
 	for pass_num in range(n_passes):
-		params = make_params(start, years, f"RL_TraderTrain_year={start_year}")
+		params = make_params(start, years, f"RL_{label}_on{start_year}")
 		env    = RLTradingEnvironment(params, picker)
-		if pass_num == 0 and checkpoint is None:
+		if pass_num == 0:
 			bc = trainer.bc_warmup(env)
 			print(f"    BC warmup: loss={bc['bc_loss']:.4f}  samples={bc['bc_samples']}")
+		# Linear entropy decay per period: 0.10 (explore) → 0.01 (exploit)
+		progress = pass_num / max(n_passes - 1, 1)
+		trainer.entropy_coef = 0.10 * (1.0 - 0.9 * progress)
+		# Cosine LR schedule per period: 3e-4 → 1e-5
+		lr = 1e-5 + 0.5 * (3e-4 - 1e-5) * (1.0 + float(np.cos(np.pi * progress)))
+		for param_group in trainer.optimizer.param_groups:
+			param_group['lr'] = lr
 		stats  = trainer.run_episode(env)
 		total_ep += 1
 		print(f"    pass {pass_num+1}/{n_passes}  ep={total_ep:3d} | "
@@ -143,41 +153,53 @@ def run_rl_trader(model_path: str, params: TradeModelParams, picker: StockPicker
 		"total_reward":     float(log_df["reward"].sum())  if not log_df.empty else 0.0,
 	}
 
+_inx_prices_cache: pd.Series = None  # Pre-loaded in main thread; thread-safe for reads
+
+def _preload_inx(all_periods: list):
+	"""Load the full .INX price history once in the main thread before spawning workers.
+	Avoids concurrent SQL/download attempts that fail silently under threading."""
+	global _inx_prices_cache
+	full_start = all_periods[0][0]
+	last_start, last_years = all_periods[-1]
+	full_end = str((pd.Timestamp(last_start) + pd.DateOffset(years=last_years + 1)).date())
+	p = PricingData('.INX')
+	if p.LoadHistory(requestedStartDate=full_start, requestedEndDate=full_end):
+		_inx_prices_cache = p.historicalPrices['Close']
+		print(f"  .INX loaded: {_inx_prices_cache.index[0].date()} → {_inx_prices_cache.index[-1].date()}  ({len(_inx_prices_cache)} days)")
+	else:
+		print("  Warning: could not load .INX prices — benchmark metrics will be 0")
+
+
 def run_benchmark(params: TradeModelParams) -> dict:
-	"""S&P 500 (.INX) buy-and-hold benchmark — start fully invested, never rebalance."""
-	tm = TradingModel(
-		modelName='BM_INX',
-		startingTicker='.INX',
-		startDate=params.startDate,
-		durationInYears=params.durationInYears,
-		totalFunds=params.portfolioSize,
-		verbose=False
-	)
+	"""S&P 500 buy-and-hold benchmark computed from pre-loaded .INX price cache."""
+	if _inx_prices_cache is None:
+		return {"bm_final_value": params.portfolioSize, "bm_total_return_pct": 0.0,
+				"bm_cagr_pct": 0.0, "bm_sharpe": 0.0, "bm_max_drawdown_pct": 0.0}
 
-	# Advance day-by-day, sampling value every REEVAL_INTERVAL days to match RL step frequency
-	vals, day = [params.portfolioSize], 0
-	while not tm.ModelCompleted():
-		tm.ProcessDay()
-		day += 1
-		if day % REEVAL_INTERVAL == 0:
-			cash, assets = tm.GetValue()
-			vals.append(cash + assets)
+	start = pd.Timestamp(params.startDate)
+	end   = start + pd.DateOffset(years=params.durationInYears)
+	prices = _inx_prices_cache[
+		(_inx_prices_cache.index >= start) & (_inx_prices_cache.index <= end)
+	]
+	if len(prices) < 2:
+		return {"bm_final_value": params.portfolioSize, "bm_total_return_pct": 0.0,
+				"bm_cagr_pct": 0.0, "bm_sharpe": 0.0, "bm_max_drawdown_pct": 0.0}
 
-	final_value = tm.CloseModel(params)
 	start_value = params.portfolioSize
+	port_vals   = (prices.values / prices.values[0]) * start_value
+	final_value = float(port_vals[-1])
 	years       = params.durationInYears
 	cagr        = ((final_value / start_value) ** (1.0 / years) - 1) * 100 if years > 0 else 0.0
 
-	vals        = np.array(vals)
 	steps_per_year = 252 / REEVAL_INTERVAL
-	if len(vals) > 1:
-		step_rets = np.diff(vals) / np.maximum(vals[:-1], 1e-8)
+	sampled = port_vals[::REEVAL_INTERVAL]
+	if len(sampled) > 1:
+		step_rets = np.diff(sampled) / np.maximum(sampled[:-1], 1e-8)
 		sharpe    = float(step_rets.mean() / (step_rets.std() + 1e-8) * np.sqrt(steps_per_year))
-		peak      = np.maximum.accumulate(vals)
-		max_dd    = float((vals - peak).min() / np.maximum(peak.max(), 1e-8) * 100)
+		peak      = np.maximum.accumulate(sampled)
+		max_dd    = float((sampled - peak).min() / np.maximum(peak.max(), 1e-8) * 100)
 	else:
-		sharpe = 0.0
-		max_dd = 0.0
+		sharpe, max_dd = 0.0, 0.0
 
 	return {
 		"bm_final_value":      final_value,
@@ -242,7 +264,6 @@ def _run_fold(fold_idx: int, all_periods: list, state: dict) -> dict:
 		done_periods = set(state["trained_periods"].get(str(test_year), []))
 
 	train_indices = [i for i in range(len(all_periods)) if i != fold_idx]
-	random.shuffle(train_indices)
 	for i in train_indices:
 		train_start, train_years = all_periods[i]
 		train_year = pd.Timestamp(train_start).year
@@ -254,7 +275,7 @@ def _run_fold(fold_idx: int, all_periods: list, state: dict) -> dict:
 		with _print_lock:
 			print(f"[fold test={test_year}] Training on {train_year}  ({len(tickers)} tickers)")
 		picker.AlignToList(tickers)
-		train_one_period(model_path, (train_start, train_years), picker)
+		train_one_period(model_path, (train_start, train_years), picker, fold_label=f"test{test_year}")
 		with _state_lock:
 			state["trained_periods"].setdefault(str(test_year), []).append(train_start)
 			_persist_state(state)
@@ -286,6 +307,92 @@ def _run_fold(fold_idx: int, all_periods: list, state: dict) -> dict:
 			  f"BM: {metrics['bm_total_return_pct']:+.1f}% / {metrics['bm_cagr_pct']:+.1f}% CAGR")
 	return metrics
 
+def train_full_history_model(
+	n_passes: int = 90,
+	n_sweeps: int = 3,
+	model_path: str = None,
+) -> str:
+	"""
+	Train a model on all 15 periods with no holdout fold, for use in run_full_history_test.
+	CV fold models each hold out one period, so none is optimal for a continuous 45-year run.
+	Uses historically-accurate ticker lists for each 3-year period.
+	Multiple sweeps revisit all periods so later periods reinforce earlier learning.
+	"""
+	if model_path is None:
+		model_path = f"data/models/rl_trader_{VERSION}_full_history.pt"
+	os.makedirs("data/models", exist_ok=True)
+
+	full_start = ALL_PERIODS[0][0]
+	last_start, last_years = ALL_PERIODS[-1]
+	full_end = pd.Timestamp(last_start) + pd.DateOffset(years=last_years)
+
+	passes_per_sweep = max(n_passes // n_sweeps, 1)
+	print(f"\nTraining full-history model: {n_sweeps} sweeps × {passes_per_sweep} passes "
+		  f"across {len(ALL_PERIODS)} periods ...")
+	picker = StockPicker(startDate=full_start, endDate=str(full_end.date()), pickHistoryWindow=28)
+
+	for sweep in range(n_sweeps):
+		print(f"\n  Sweep {sweep + 1}/{n_sweeps}")
+		for start, years in ALL_PERIODS:
+			train_year = pd.Timestamp(start).year
+			tickers = TickerLists.GetTickerListSQL(year=train_year, month=1)
+			print(f"    Period {train_year}: {len(tickers)} tickers")
+			picker.AlignToList(tickers)
+			train_one_period(model_path, (start, years), picker, n_passes=passes_per_sweep, fold_label=f"full_s{sweep+1}")
+
+	print(f"  Full-history model saved to {model_path}")
+	return model_path
+
+
+def run_full_history_test(
+	model_path: str = None,
+	start: str = '1/1/1980',
+	years: int = 45,
+	results_path: str = "data/rl_full_history_test.csv",
+):
+	"""Run a single trained model across the full 45-year history for comparison with AlphaTrader."""
+	if model_path is None:
+		full_history_path = f"data/models/rl_trader_{VERSION}_full_history.pt"
+		fallback_path     = f"data/models/rl_trader_{VERSION}_test_year2022.pt"
+		model_path = full_history_path if os.path.exists(full_history_path) else fallback_path
+	if not os.path.exists(model_path):
+		print(f"  Model not found: {model_path}")
+		return
+
+	print(f"\nFull-history test: {model_path}")
+	print(f"  Period: {start} → {years} years")
+
+	end_date = pd.Timestamp(start) + pd.DateOffset(years=years)
+
+	# Union of historically-accurate ticker lists gives the picker access to all stocks
+	# that were S&P components in each era, not just the 2022 list.
+	all_tickers: set = set()
+	for period_start, _ in ALL_PERIODS:
+		period_year = pd.Timestamp(period_start).year
+		all_tickers.update(TickerLists.GetTickerListSQL(year=period_year, month=1))
+	print(f"  Loading picker ({len(all_tickers)} tickers across all periods) ...")
+	picker = StockPicker(startDate=start, endDate=str(end_date.date()), pickHistoryWindow=28)
+	picker.AlignToList(list(all_tickers))
+
+	params = make_params(start, years, "RL_FullHistory_Test")
+	params.saveTradeHistory = True
+	metrics = run_rl_trader(model_path, params, picker)
+
+	if _inx_prices_cache is None:
+		_preload_inx([('1/1/1980', 1), (str(end_date.year - 1) + '/1/1', 1)])
+	bm = run_benchmark(make_params(start, years))
+	metrics.update(bm)
+
+	print(f"\n  RL:  Return={metrics['total_return_pct']:+.1f}%  CAGR={metrics['cagr_pct']:+.1f}%  "
+		  f"Sharpe={metrics['sharpe_ratio']:.2f}  MaxDD={metrics['max_drawdown_pct']:.1f}%")
+	print(f"  BM:  Return={metrics['bm_total_return_pct']:+.1f}%  CAGR={metrics['bm_cagr_pct']:+.1f}%  "
+		  f"Sharpe={metrics['bm_sharpe']:.2f}  MaxDD={metrics['bm_max_drawdown_pct']:.1f}%")
+
+	pd.DataFrame([metrics]).to_csv(results_path, index=False)
+	print(f"  Saved to {results_path}")
+	return metrics
+
+
 def cross_validate(all_periods: list, results_path: str = "data/rl_cross_validation.csv"):
 	"""
 	Leave-one-out cross-validation — one thread per fold, all running in parallel.
@@ -294,6 +401,7 @@ def cross_validate(all_periods: list, results_path: str = "data/rl_cross_validat
 	"""
 	os.makedirs("data/models", exist_ok=True)
 	os.makedirs("data", exist_ok=True)
+	_preload_inx(all_periods)  # Load .INX once before spawning threads
 
 	state = _load_state()
 	completed_years = set(state["completed_folds"].keys())
@@ -326,4 +434,6 @@ def cross_validate(all_periods: list, results_path: str = "data/rl_cross_validat
 	print(f"  Avg Return: {avg['total_return_pct']:+.1f}%  |  Avg CAGR: {avg['cagr_pct']:+.1f}%")
 
 if __name__ == "__main__":
-	cross_validate(ALL_PERIODS)
+	#cross_validate(ALL_PERIODS)
+	train_full_history_model()
+	run_full_history_test()
