@@ -7,7 +7,7 @@ from _classes.Selection import StockPicker, AdaptiveConvexMarketState
 from _classes.Prices import PricingData
 
 HOLDING_PERIOD_DAYS = 40   # Target 30-60 day holds; use 40 as midpoint
-REEVAL_INTERVAL     = 20   # Days between agent decisions (~monthly rebalancing)
+REEVAL_INTERVAL     = 5    # Days between agent decisions (weekly, matches AlphaTrader reEvaluationInterval)
 
 # Action decoding table
 FILTER_BLENDS = {
@@ -26,14 +26,13 @@ N_COUNTS = len(STOCK_COUNTS)
 
 
 def decode_action(action_idx: int) -> tuple:
-    """Convert flat action index → (blend_key, stock_count, rebalance_now)"""
-    rebalance = action_idx % 2           # 0 = hold, 1 = rebalance
-    remainder = action_idx // 2
-    count_idx = remainder % N_COUNTS
-    blend_key = remainder // N_COUNTS
-    blend_key = min(blend_key, N_BLENDS - 1)
-    stock_count = STOCK_COUNTS[count_idx]
-    return blend_key, stock_count, bool(rebalance)
+    """Convert flat action index → (blend_key, stock_count, rebalance_now)
+    Action space: 8 blends × 2 (hold/rebalance) = 16 actions.
+    Stock count is fixed at 9 (typical AdaptiveConvex default).
+    """
+    rebalance = action_idx % 2
+    blend_key = (action_idx // 2) % N_BLENDS
+    return blend_key, 9, bool(rebalance)
 
 
 class RLTradingEnvironment:
@@ -75,6 +74,7 @@ class RLTradingEnvironment:
         self._last_portfolio_value = self.params.portfolioSize
         self._peak_value = self.params.portfolioSize
         self._step_count = 0
+        self._last_action_encoded = [0.0, 0.0]
         return self._get_state()
     
     def step(self, action_idx: int) -> tuple:
@@ -87,10 +87,13 @@ class RLTradingEnvironment:
         
         cash, assets = self.tm.GetValue()
         value_before = cash + assets
-        
-        # Execute action: pick stocks and align positions
-        if blend_key < 7:  # Not cash
-            if rebalance_now or self._step_count == 0:
+        self._last_portfolio_value = value_before  # snapshot start-of-step value for port_1m feature
+
+        # Align positions, then advance REEVAL_INTERVAL days.
+        # With REEVAL_INTERVAL=5 this is one call per 5-day window — identical to
+        # AlphaTrader's reEvaluationInterval, so the 20% rate limit executes correctly.
+        if rebalance_now or self._step_count == 0:
+            if blend_key < 7:
                 candidates = self._get_candidates(blend_key, stock_count)
                 if candidates is not None:
                     self.tm.AlignPositions(
@@ -99,59 +102,41 @@ class RLTradingEnvironment:
                         shopBuyPercent=self.params.shopBuyPercent,
                         shopSellPercent=self.params.shopSellPercent
                     )
-        elif rebalance_now or self._step_count == 0:
-            # Go to cash only when explicitly rebalancing; holding without rebalancing
-            # keeps existing positions so the model isn't forced to churn each step
-            self.tm.AlignPositions(targetPositions=None)
-        
-        # Advance N days
-        days_advanced = 0
+            else:
+                self.tm.AlignPositions(targetPositions=None)
         for _ in range(REEVAL_INTERVAL):
             if self.tm.ModelCompleted():
                 break
             self.tm.ProcessDay()
-            days_advanced += 1
-        
+
         cash, assets = self.tm.GetValue()
         value_after = cash + assets
         done = self.tm.ModelCompleted()
-        
-        # Reward: log return over the step period
-        # Log return is better than % return: symmetric, additive across steps
-        reward = np.log(value_after / value_before) if value_before > 0 else 0.0
-        
-        # Hold/churn shaping — thresholds in calendar days, scaled to REEVAL_INTERVAL
-        avg_age = self._get_avg_position_age()
-        hold_min = REEVAL_INTERVAL                  # 1 full interval (~20 days)
-        hold_max = REEVAL_INTERVAL * 4              # 4 intervals (~80 days)
-        churn_threshold = int(REEVAL_INTERVAL * 1.5)
-        if hold_min <= avg_age <= hold_max and not rebalance_now:
-            reward += 0.005
-        elif rebalance_now and avg_age < churn_threshold:
-            reward -= 0.010
 
-        # Opportunity-cost drag on idle cash (~2.5% annualised at ~12 steps/year)
-        cash_val, _ = self.tm.GetValue()
-        cash_pct = cash_val / max(value_after, 1e-8)
+        # Reward: log return over the full REEVAL_INTERVAL period
+        reward = np.log(value_after / value_before) if value_before > 0 else 0.0
+
+        # Small opportunity-cost drag for >90% idle cash
+        cash_pct = cash / max(value_after, 1e-8)
         if cash_pct > 0.9:
             reward -= 0.0005
 
-        # Drawdown penalty — discourages deep losses relative to episode peak
+        # Drawdown penalty relative to episode peak
         self._peak_value = max(self._peak_value or value_after, value_after)
         drawdown = max(0.0, (self._peak_value - value_after) / max(self._peak_value, 1e-8))
         if drawdown > 0.05:
             reward -= 0.003 * drawdown
-        
-        self._last_portfolio_value = value_after
+
         self._step_count += 1
-        
+        self._last_action_encoded = [blend_key / (N_BLENDS - 1), float(rebalance_now)]
+
         next_state = self._get_state()
         info = {
             "portfolio_value": value_after,
             "blend_key": blend_key,
             "stock_count": stock_count,
             "rebalanced": rebalance_now,
-            "avg_position_age": avg_age,
+            "avg_position_age": self._get_avg_position_age(),
         }
         return next_state, reward, done, info
     
@@ -212,6 +197,7 @@ class RLTradingEnvironment:
             universe_feats,
             portfolio_feats,
             cal_feats,
+            np.array(self._last_action_encoded, dtype=np.float32),
         ]).astype(np.float32)
         
         # Safety: replace NaN/Inf with 0
@@ -269,10 +255,10 @@ class RLTradingEnvironment:
             top10 = pc1y.nlargest(10).mean() if len(pc1y) >= 10 else pc1y.mean()
             top3 = pc1y.nlargest(3).sum() / max(pc1y.sum(), 1e-6)
             return np.array([
-                float(pc1y.mean()),
-                float(pc1y.std()),
-                float(top10),
-                float(df['pc3m'].mean()),
+                float(np.clip(pc1y.mean(),        -1.0, 3.0)),   # 1yr mean; clip bull-market extremes
+                float(np.clip(pc1y.std(),          0.0, 1.5)),   # 1yr cross-sectional std
+                float(np.clip(top10,              -0.5, 3.0)),   # top-10 1yr mean
+                float(np.clip(df['pc3m'].mean(),  -0.5, 1.0)),   # 3-month mean
                 float((pc1y > 0).mean()),
                 float((pc1m > 0).mean()),
                 float(np.clip(top3, 0, 1)),
@@ -315,7 +301,7 @@ class RLTradingEnvironment:
                 float(np.clip(avg_pnl, -0.5, 0.5)),
                 float(np.clip(worst_pnl, -0.5, 0.5)),
                 float(np.clip(port_1m, -0.3, 0.3)),
-                float(np.clip(self._step_count / max((self.params.durationInYears * 252) / REEVAL_INTERVAL, 1), 0, 1)),
+                float(np.clip(self._step_count / (CONSTANTS.TRADING_YEAR / REEVAL_INTERVAL), 0, 2.0)),
             ], dtype=np.float32)
         except Exception:
             return np.zeros(7, dtype=np.float32)

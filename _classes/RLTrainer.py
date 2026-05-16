@@ -5,7 +5,7 @@ import torch.optim as optim
 import numpy as np
 from collections import deque
 from typing import List, Tuple
-from _classes.RLEnvironment import FILTER_BLENDS, STOCK_COUNTS, N_COUNTS
+from _classes.RLEnvironment import FILTER_BLENDS, STOCK_COUNTS
 
 
 def _match_filter_to_blend(filters) -> int:
@@ -70,7 +70,7 @@ def generate_behavioral_cloning_data(
             # Map filter list → nearest blend key
             blend_key = _match_filter_to_blend(filters)
             count_idx = _match_count_to_idx(stock_count)
-            action_idx = blend_key * N_COUNTS * 2 + count_idx * 2 + 1  # rebalance=True
+            action_idx = blend_key * 2 + 1  # rebalance=True; stock count fixed at 9
             
             # We'll need to build state from env — skip here and collect via env.reset/step
             data.append((date, action_idx, conviction))
@@ -106,12 +106,12 @@ class PPOTrainer:
         self,
         model: 'MomentumActorCritic',
         lr: float = 3e-4,
-        gamma: float = 0.95,          # Discount; 0.95 ≈ 65-day half-life at 20-day steps
+        gamma: float = 0.99,          # Discount; gamma^50 ≈ 0.60 at 5-day steps (~1-year horizon)
         gae_lambda: float = 0.95,     # GAE smoothing
         clip_epsilon: float = 0.2,    # PPO clip ratio
-        entropy_coef: float = 0.05,   # Exploration bonus
+        entropy_coef: float = 0.10,   # Initial exploration bonus; decayed externally per pass
         value_coef: float = 0.5,      # Critic loss weight
-        n_epochs: int = 4,            # PPO update epochs per rollout
+        n_epochs: int = 10,           # PPO update epochs per rollout
     ):
         self.model = model
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -125,6 +125,10 @@ class PPOTrainer:
         # Tracking
         self.episode_returns = deque(maxlen=100)
         self.episode_cagrs = deque(maxlen=100)
+        # Welford running stats for online reward normalisation
+        self._rn_count = 0
+        self._rn_mean  = 0.0
+        self._rn_m2    = 0.0
     
     def compute_gae(
         self,
@@ -214,23 +218,39 @@ class PPOTrainer:
             "entropy": total_entropy / self.n_epochs,
         }
     
+    def _update_reward_stats(self, r: float):
+        """Welford online algorithm — update running mean and variance."""
+        self._rn_count += 1
+        delta = r - self._rn_mean
+        self._rn_mean += delta / self._rn_count
+        self._rn_m2   += delta * (r - self._rn_mean)
+
+    def _normalize_reward(self, r: float) -> float:
+        """Standardise reward using running stats; returns r unchanged until count >= 2."""
+        if self._rn_count < 2:
+            return r
+        std = (self._rn_m2 / (self._rn_count - 1)) ** 0.5
+        return (r - self._rn_mean) / max(std, 1e-8)
+
     def run_episode(self, env: 'RLTradingEnvironment') -> dict:
         """Collect one full episode (one year of trading) of experience."""
         state = env.reset()
         states, actions, log_probs, rewards, values, dones = [], [], [], [], [], []
-        
+
         done = False
         episode_return = 0.0
-        
+
         while not done:
             state = np.nan_to_num(np.asarray(state, dtype=np.float32), nan=0.0, posinf=1.0, neginf=-1.0)
             state_t = torch.FloatTensor(state).unsqueeze(0)
-            
+
             with torch.no_grad():
                 action, log_prob, _, value = self.model.get_action(state_t)
-            
+
             next_state, reward, done, info = env.step(action.item())
-            
+            self._update_reward_stats(reward)
+            reward = self._normalize_reward(reward)
+
             states.append(state)
             actions.append(action.item())
             log_probs.append(log_prob.item())
@@ -238,7 +258,7 @@ class PPOTrainer:
             values.append(value.item())
             dones.append(done)
             episode_return += reward
-            
+
             state = next_state
         
         # Compute GAE
@@ -283,12 +303,11 @@ class PPOTrainer:
                 env.tm.currentDate, len(env.picker._tickerList)
             )
             if ms is not None:
-                blend_key      = _match_filter_to_blend(ms.GetExecutionFilters())
-                count_idx      = _match_count_to_idx(ms.GetStockCount())
-                conviction     = float(ms.conviction_score)
-                rebalance_int  = 1 if conviction > 0.6 else 0
-                teacher        = blend_key * N_COUNTS * 2 + count_idx * 2 + rebalance_int
-                weight         = conviction
+                blend_key     = _match_filter_to_blend(ms.GetExecutionFilters())
+                conviction    = float(ms.conviction_score)
+                rebalance_int = 1 if conviction > 0.6 else 0
+                teacher       = blend_key * 2 + rebalance_int  # matches 16-action space
+                weight        = conviction
 
                 state_arr = np.nan_to_num(np.asarray(state, dtype=np.float32), nan=0.0)
                 loss = behavioral_cloning_loss(
